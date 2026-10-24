@@ -1,4 +1,4 @@
-// Auto Edit Robot: turns a folder of photos + clips into one muted vertical video (1080x1920, 30 fps) with transitions.
+// Auto Edit Robot: turns a folder of photos + clips into one muted vertical video (1080x1920, 60 fps) with transitions.
 // See README.md. CLI: node render.js <inDir> <outFile> <smooth|punchy|beat|hype|soft|smart> [seconds]
 const fs = require("fs");
 const path = require("path");
@@ -8,7 +8,10 @@ const { labelShots, productName } = require("./vision");
 
 const FFMPEG = process.env.FFMPEG || "ffmpeg";
 const FFPROBE = process.env.FFPROBE || "ffprobe";
-const W = 1080, H = 1920, FPS = 30;
+const W = 1080, H = 1920;
+const FPS = Number(process.env.OUTPUT_FPS) || 60; // 60 = smoother zooms, slides and shakes (platforms all accept 60)
+// Effect timings below were tuned in frames at 30 fps; fr() turns them into this frame rate, so they last as long.
+const fr = (frames30) => Math.max(1, Math.round((frames30 * FPS) / 30));
 const PHOTO_SECONDS = 2.5;
 
 const IMAGE_EXT = new Set([".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif"]);
@@ -100,7 +103,7 @@ function fit(prefix, { width, height }) {
 
 // Photo motion: smooth and soft = slow zoom (alternating in/out), punchy and beat = quick zoom punch then a small drift.
 function zoomExpr(style, index, frames) {
-  if (style !== "smooth" && style !== "soft") return `if(lt(on,10),1.22-0.22*on/10,1+0.03*(on-10)/${frames - 10})`;
+  if (style !== "smooth" && style !== "soft") return `if(lt(on,${fr(10)}),1.22-0.22*on/${fr(10)},1+0.03*(on-${fr(10)})/${frames - fr(10)})`;
   return index % 2 === 0 ? `1+0.10*on/${frames - 1}` : `1.10-0.10*on/${frames - 1}`;
 }
 
@@ -127,7 +130,7 @@ function spread(items, look, durationAt) {
 // BEAT: 1-beat pieces; "into" says how a piece starts: a hard cut, or a whip / zoom blur every few cuts.
 function planBeat(items, look) {
   const pieces = spread(items, look, () => look.beat);
-  pieces.slice(0, look.stutter).forEach((p) => (p.dur = Math.min(p.dur, 4 / FPS))); // 4-frame stutter hook
+  pieces.slice(0, look.stutter).forEach((p) => (p.dur = Math.min(p.dur, 4 / 30))); // stutter hook: 0.13 s flashes
   pieces.forEach((p, j) => (p.into = j && j % look.blurEvery === 0 ? ((j / look.blurEvery) % 2 ? "whip" : "zoomblur") : "cut"));
   return pieces;
 }
@@ -157,15 +160,23 @@ function planHype(items, look) {
   return pieces.length > 1 ? [...order, pieces.at(-1)] : pieces;
 }
 
+// The frames of step k of a short effect that was 1 frame per step at 30 fps (e.g. a 3-step blur: strong → weak),
+// counted from the start of a piece, or backwards from its end (fromEnd, with the piece's frame count).
+function frameRange(k, fromEnd, frames) {
+  const first = k === 0 ? 0 : fr(k), last = fr(k + 1) - 1;
+  return fromEnd ? `between(n,${frames - 1 - last},${frames - 1 - first})` : `between(n,${first},${last})`;
+}
+
 // HYPE camera moves as zoompan expressions. N = frame number; s scales pixel offsets to zoompan's input size.
 function hypeMotion(p, frames, N, s) {
   const fx = p.fx || {};
   let z = "1";
-  if (fx.punch || fx.flash) z += `+0.15*max(0,1-${N}/5)`; // zoom punch: starts 15% in, settles in 5 frames
+  if (fx.punch || fx.flash) z += `+0.15*max(0,1-${N}/${fr(5)})`; // zoom punch: starts 15% in, settles in 1/6 s
   if (fx.shake) z += "+0.07"; // room to shake
   z += p.part === "intro" ? `+0.08*${N}/${frames}` : `+0.03*${N}/${frames}`; // slow push-in / small drift
-  const shake = (a, wave) => (fx.shake ? `+${a * s}*max(0,1-${N}/8)*${wave}` : ""); // jitter that dies out in 8 frames
-  return `z='${z}':x='iw/2-(iw/zoom/2)${shake(30, `sin(${N}*2.9)`)}':y='ih/2-(ih/zoom/2)${shake(24, `cos(${N}*3.7)`)}'`;
+  const shake = (a, wave) => (fx.shake ? `+${a * s}*max(0,1-${N}/${fr(8)})*${wave}` : ""); // jitter that dies out in 0.27 s
+  const speed = (30 / FPS).toFixed(3); // same wobble speed at any frame rate
+  return `z='${z}':x='iw/2-(iw/zoom/2)${shake(30, `sin(${N}*2.9*${speed})`)}':y='ih/2-(ih/zoom/2)${shake(24, `cos(${N}*3.7*${speed})`)}'`;
 }
 
 // HYPE looks: dim intro (fading in from black), contrasty drop, a white frame + bright fade on flash cuts, red/blue
@@ -174,8 +185,8 @@ function hypeEffects(graph, p, frames, look) {
   const fx = p.fx || {}, D = frames / FPS;
   if (p.part === "intro") return graph + `,${look.introGrade}` + (p.first ? ",fade=t=in:st=0:d=0.5" : "");
   graph += `,${look.grade}`;
-  if (fx.flash) graph += ",drawbox=color=white:t=fill:enable='eq(n,0)',eq=brightness='0.5*max(0,1-n/4)':eval=frame";
-  if (fx.rgb) [24, 14, 6].forEach((a, k) => (graph += `,rgbashift=rh=-${a}:bh=${a}:enable='eq(n,${k})'`));
+  if (fx.flash) graph += `,drawbox=color=white:t=fill:enable='lt(n,${fr(1)})',eq=brightness='0.5*max(0,1-n/${fr(4)})':eval=frame`;
+  if (fx.rgb) [24, 14, 6].forEach((a, k) => (graph += `,rgbashift=rh=-${a}:bh=${a}:enable='${frameRange(k, false, 0)}'`));
   if (p.part === "ending") graph += `,fade=t=out:color=white:st=${(D - 0.7).toFixed(3)}:d=0.1,fade=t=out:st=${(D - 0.5).toFixed(3)}:d=0.5`;
   return graph;
 }
@@ -191,7 +202,7 @@ function planSoft(items, look) {
 }
 
 // SOFT beat pulse: a 3% zoom bump around the beat in the middle of the shot (N = zoompan's frame number).
-const softPulse = (look, N) => `0.03*max(0,1-abs(${N}-${Math.round(look.pulse * FPS)})/4)`;
+const softPulse = (look, N) => `0.03*max(0,1-abs(${N}-${Math.round(look.pulse * FPS)})/${fr(4)})`;
 
 // SOFT looks: warm colours, fade in / out at the ends. (The dissolves are crossfades made when the pieces are joined.)
 function softEffects(graph, p, frames, look) {
@@ -223,9 +234,9 @@ async function planSmartEdit(items, look, { length, skip, log } = {}) {
 // SMART looks: real colours (buyers should see the true product); whips only where the plan found the camera moving
 // the same way on both sides of a cut (blurred along that move, strongest at the cut); a fade out at the end.
 function smartEffects(graph, p, next, frames) {
-  const whip = (angle, frameAt) => [60, 35, 15].map((r, k) => `,dblur=angle=${angle}:radius=${r}:enable='eq(n,${frameAt(k)})'`).join("");
-  if (p.into === "whip") graph += whip(p.angle, (k) => k);
-  if (next?.into === "whip") graph += whip(next.angle, (k) => frames - 1 - k);
+  const whip = (angle, fromEnd) => [60, 35, 15].map((r, k) => `,dblur=angle=${angle}:radius=${r}:enable='${frameRange(k, fromEnd, frames)}'`).join("");
+  if (p.into === "whip") graph += whip(p.angle, false);
+  if (next?.into === "whip") graph += whip(next.angle, true);
   if (p.last) {
     const f = Math.min(0.4, frames / FPS / 2);
     graph += `,fade=t=out:st=${(frames / FPS - f).toFixed(3)}:d=${f.toFixed(3)}`;
@@ -233,19 +244,19 @@ function smartEffects(graph, p, next, frames) {
   return graph;
 }
 
-// BEAT blur transitions live inside the pieces: the 3 frames before a blur cut and the 3 after it (strongest at the cut).
+// BEAT blur transitions live inside the pieces: the 0.1 s before a blur cut and the 0.1 s after it (strongest at the cut).
 function beatEffects(graph, p, next, frames, isLast, look) {
   graph += `,${look.grade}`;
   const head = p.into, tail = next?.into || "cut";
   if (head === "whip" || tail === "whip") {
     [60, 35, 15].forEach((radius, k) => {
-      const on = [head === "whip" && `eq(n,${k})`, tail === "whip" && `eq(n,${frames - 1 - k})`].filter(Boolean).join("+");
+      const on = [head === "whip" && frameRange(k, false, frames), tail === "whip" && frameRange(k, true, frames)].filter(Boolean).join("+");
       graph += `,dblur=angle=0:radius=${radius}:enable='${on}'`;
     });
   }
   if (head === "zoomblur" || tail === "zoomblur") {
     // A zoom blur is the frame averaged with bigger and bigger copies of itself (8 copies = smooth streaks).
-    const on = [head === "zoomblur" && "lte(n,2)", tail === "zoomblur" && `gte(n,${frames - 3})`].filter(Boolean).join("+");
+    const on = [head === "zoomblur" && `lte(n,${fr(3) - 1})`, tail === "zoomblur" && `gte(n,${frames - fr(3)})`].filter(Boolean).join("+");
     const copies = [0, 1, 2, 3, 4, 5, 6, 7];
     graph += `[zin];[zin]split=2[zo][z];[z]split=8${copies.map((k) => `[z${k}]`).join("")};` +
       copies.map((k) => `[z${k}]scale=${even(W * (1 + 0.05 * k))}:${even(H * (1 + 0.05 * k))},crop=${W}:${H}[zs${k}];`).join("") +
@@ -287,8 +298,8 @@ async function makeSegment(p, style, look, index, outFile, next, isLast) {
       graph += `,zoompan=${hypeMotion(p, frames, "on", 1)}:d=1:s=${W}x${H}:fps=${FPS}`;
     }
     if (style === "soft") graph += `,zoompan=z='1+${softPulse(look, "on")}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=${W}x${H}:fps=${FPS}`;
-    if (style === "smart" && p.into === "punch") { // the payoff reveal: starts 15% in, settles in 5 frames
-      graph += `,zoompan=z='1+0.15*max(0,1-on/5)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=${W}x${H}:fps=${FPS}`;
+    if (style === "smart" && p.into === "punch") { // the payoff reveal: starts 15% in, settles in 1/6 s
+      graph += `,zoompan=z='1+0.15*max(0,1-on/${fr(5)})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=${W}x${H}:fps=${FPS}`;
     }
   }
   if (style === "beat") graph = beatEffects(graph, p, next, frames, isLast, look);
@@ -395,7 +406,7 @@ async function render({ inDir, outFile, style = "smooth", length, tmpDir, log = 
   return result;
 }
 
-module.exports = { render, probe, run, jpegOrientation, FFMPEG, STYLE_NAMES: Object.keys(STYLES) };
+module.exports = { render, probe, run, jpegOrientation, FFMPEG, FPS, STYLE_NAMES: Object.keys(STYLES) };
 
 if (require.main === module) {
   const [inDir, outFile, style, length] = process.argv.slice(2);

@@ -4,7 +4,8 @@ const fs = require("fs");
 const http = require("http");
 const path = require("path");
 const { spawn } = require("child_process");
-const { run, jpegOrientation, FFMPEG } = require("./render");
+const { run, jpegOrientation, FFMPEG, FPS } = require("./render");
+const at = (frame30) => Math.round((frame30 * FPS) / 30); // a moment given in 30 fps frames, as a frame at the output rate
 const { analyzeClip } = require("./smart");
 const { tagSize, tagHands, labelShots, MODEL } = require("./vision");
 
@@ -193,24 +194,25 @@ async function main() {
       const info = JSON.parse(await run(process.env.FFPROBE || "ffprobe", ["-v", "error", "-print_format", "json", "-show_streams", "-show_format", video]));
       const v = info.streams.find((s) => s.codec_type === "video");
       check(v && v.width === 1080 && v.height === 1920, "vertical 1080x1920");
-      check(v && v.r_frame_rate === "30/1" && v.pix_fmt === "yuv420p" && v.codec_name === "h264", "H.264, 30 fps, yuv420p");
+      check(v && v.r_frame_rate === `${FPS}/1` && v.pix_fmt === "yuv420p" && v.codec_name === "h264", `H.264, ${FPS} fps, yuv420p`);
       check(!info.streams.some((s) => s.codec_type === "audio"), "muted (no audio track)");
       check(!(v.side_data_list || []).some((d) => d.rotation !== undefined), "no leftover rotate flag (apps show it upright)");
       check(near(Number(info.format.duration), expected[style]), `length ${Number(info.format.duration).toFixed(2)} s ≈ ${expected[style].toFixed(2)} s`);
       if (style === "hype") {
-        // Brightness (16 = black, 235 = white) at key frames: intro fades in, reveal flash at frame 72, the repeat
-        // starts with the same flash at frame 198, the ending flashes white (frame 289) then fades to black.
-        const [first, reveal, repeat, endFlash, last] = await Promise.all([0, 72, 198, 289, 305].map((n) => lumaAt(video, n)));
+        // Brightness (16 = black, 235 = white) at key moments (in 30 fps frames): intro fades in, reveal flash at 72, the repeat
+        // starts with the same flash at 198, the ending flashes white (289) then fades to black.
+        const [first, reveal, repeat, endFlash, last] = await Promise.all([0, at(72), at(198), at(289), at(306) - 1].map((n) => lumaAt(video, n)));
         check(first < 30, `intro fades in from black (frame 0 brightness ${first})`);
         check(reveal > 200 && repeat > 200, `flash cut on the reveal and again on the repeat (${reveal}, ${repeat})`);
         check(endFlash > 200 && last < 30, `ending flashes white then fades to black (${endFlash} → ${last})`);
       }
       if (style === "soft") {
-        // No white anywhere. The 1st crossfade (dark logo photo → bright colour bars) runs over frames 33-38.
+        // No white anywhere. The 1st crossfade (dark logo photo → bright colour bars) runs over 30 fps frames 33-38.
         const lumas = await frameLumas(video);
         check(lumas[0] < 30 && lumas.at(-1) < 30, `fades in from black and out to black (${lumas[0]}, ${lumas.at(-1)})`);
         check(Math.max(...lumas) < 200, `no white frames (brightest frame ${Math.max(...lumas)} of 255)`);
-        check(lumas[30] < lumas[36] && lumas[36] < lumas[42], `crossfade: the cut blends from one shot to the next (${lumas[30]} → ${lumas[36]} → ${lumas[42]})`);
+        const [x0, x1, x2] = [at(30), at(36), at(42)].map((n) => lumas[n]);
+        check(x0 < x1 && x1 < x2, `crossfade: the cut blends from one shot to the next (${x0} → ${x1} → ${x2})`);
       }
       const sheet = { beat: "fps=10,scale=135:240,tile=16x4", hype: "fps=10,scale=135:240,tile=17x6", soft: "fps=10,scale=135:240,tile=18x6" }[style]
         || "fps=2,scale=216:384,tile=10x5";

@@ -1,6 +1,6 @@
 # Auto Edit Robot 🎬
 
-A self-hosted video editor for short product videos. Drop photos and phone clips into a Google Drive folder; my homelab turns them into a **muted, vertical 1080×1920 video** with editing that follows real film-editing theory, and puts it back in Drive. I only add the music or voice-over.
+A self-hosted video editor for short product videos. Drop photos and phone clips into a Google Drive folder; my homelab turns them into a **muted, vertical 1080×1920 video at 60 fps** with editing that follows real film-editing theory, and puts it back in Drive. I only add the music or voice-over.
 
 Built for **[Techlotics](https://techlotics.github.io)** (honest budget-gadget reviews) and runs 24/7 on my homelab: a Dell OptiPlex running **Proxmox**, with an LXC container that runs **Docker**.
 
@@ -81,7 +81,7 @@ Optional vision AI: an `ollama` container on the same network with `ollama pull 
 ```bash
 node test.js /tmp/autoedit-test
 ```
-85 end-to-end checks against the real API with generated media: output format (H.264, 30 fps, 1080×1920, no audio, no leftover rotate flag), exact lengths per style, file order, broken-file handling, flash and fade timing, motion-analysis known-answer tests, the Smart Editor's story rules, the vision AI against a fake Ollama (including a look that's too slow), background jobs (reserving, instant start, progress, 409s, restart recovery), and path-traversal safety.
+85 end-to-end checks against the real API with generated media: output format (H.264, 60 fps, 1080×1920, no audio, no leftover rotate flag), exact lengths per style, file order, broken-file handling, flash and fade timing, motion-analysis known-answer tests, the Smart Editor's story rules, the vision AI against a fake Ollama (including a look that's too slow), background jobs (reserving, instant start, progress, 409s, restart recovery), and path-traversal safety.
 
 ## Tech
 Node.js (no dependencies) · FFmpeg (filter graphs, xfade, zoompan) · Docker · n8n · Ollama · Proxmox VE · Google Drive API (OAuth, least-privilege scopes)
