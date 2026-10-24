@@ -3,12 +3,36 @@
 // Tested 2026-10-24 on 13 known keyboard frames: asked "how much of the product is in the frame?", qwen3-vl:4b got 9/13
 // and qwen3-vl:8b 6/13 (it called almost everything "wide"), and both flip-flopped between near-identical frames. So
 // the AI is NOT trusted with shot size; it reliably names the product (it even read the brand) and spots hands.
+const http = require("http");
+const https = require("https");
 const { readFrames } = require("./smart");
 
-const OLLAMA = process.env.OLLAMA_URL || "http://ollama:11434";
+// Settings are read on every call, so they can be changed per run (and in tests).
+const ollama = () => process.env.OLLAMA_URL || "http://ollama:11434";
 const MODEL = process.env.VISION_MODEL || "qwen3-vl:4b-instruct";
+// One look takes ~4 s on a laptop GPU but ~4 min on the Dell's 4-core CPU, so allow 15 min per look.
+const lookLimitMs = () => (Number(process.env.VISION_LOOK_LIMIT_MIN) || 15) * 60 * 1000;
 const EVERY = 2; // seconds between looks in a clip
-const MAX_LOOKS = 4; // per clip (each look takes ~4 s on a laptop, longer on the Dell's CPU)
+const MAX_LOOKS = 4; // per clip
+
+// POST JSON with no time limit except ours. (Node's built-in fetch gives up by itself after 5 min without an answer,
+// which a slow CPU can hit.)
+function postJson(url, body, limitMs) {
+  return new Promise((resolve, reject) => {
+    const req = (url.startsWith("https:") ? https : http).request(url, { method: "POST", headers: { "Content-Type": "application/json" } },
+      (res) => {
+        let text = "";
+        res.setEncoding("utf8");
+        res.on("data", (c) => (text += c));
+        res.on("end", () => resolve({ status: res.statusCode, text }));
+        res.on("error", reject);
+      });
+    const timer = setTimeout(() => req.destroy(new Error(`no answer within ${Math.round(limitMs / 1000)} s`)), limitMs);
+    req.on("close", () => clearTimeout(timer));
+    req.on("error", reject);
+    req.end(JSON.stringify(body));
+  });
+}
 
 // "01 wide desk.mp4" → wide. Words: wide, medium (mid), close / close-up, detail (macro); hands / typing = in use.
 const TAGS = [[/\bwide\b/i, "wide"], [/\b(medium|mid)\b/i, "medium"], [/\bclose([- ]?up)?\b/i, "close-up"], [/\b(detail|macro)\b/i, "detail"]];
@@ -25,25 +49,21 @@ product: name the gadget in 1-4 words. If you can read a brand name on it, start
 hands: are any hands visible? Answer only with JSON.`;
 
 async function ask(png) {
-  const r = await fetch(`${OLLAMA}/api/chat`, {
-    method: "POST",
-    signal: AbortSignal.timeout(5 * 60 * 1000), // the Dell's CPU is slow; the first look also loads the model
-    body: JSON.stringify({ model: MODEL, stream: false, format: SCHEMA, think: false, options: { temperature: 0 },
-      messages: [{ role: "user", content: PROMPT, images: [png.toString("base64")] }] }),
-  });
-  if (!r.ok) throw new Error(`vision AI said ${r.status}: ${(await r.text()).slice(0, 200)}`);
-  const a = JSON.parse((await r.json()).message.content);
+  const r = await postJson(`${ollama()}/api/chat`, { model: MODEL, stream: false, format: SCHEMA, think: false, options: { temperature: 0 },
+    messages: [{ role: "user", content: PROMPT, images: [png.toString("base64")] }] }, lookLimitMs());
+  if (r.status !== 200) throw new Error(`vision AI said ${r.status}: ${r.text.slice(0, 200)}`);
+  const a = JSON.parse(JSON.parse(r.text).message.content);
   return { product: String(a.product || "").slice(0, 40), hands: !!a.hands };
 }
 
 // Why the vision AI can't help right now ("" = it can).
 async function visionProblem() {
   try {
-    const r = await fetch(`${OLLAMA}/api/tags`, { signal: AbortSignal.timeout(5000) });
+    const r = await fetch(`${ollama()}/api/tags`, { signal: AbortSignal.timeout(5000) });
     const models = (await r.json()).models || [];
     return models.some((m) => m.name === MODEL) ? "" : `vision AI is missing the model ${MODEL} (run: ollama pull ${MODEL})`;
   } catch {
-    return `vision AI not reachable at ${OLLAMA}: no product names or hand spotting`;
+    return `vision AI not reachable at ${ollama()}: no product names or hand spotting`;
   }
 }
 

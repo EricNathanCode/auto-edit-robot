@@ -1,11 +1,12 @@
 // End-to-end test of the Auto Edit Robot API with made-up photos and clips.
 // Usage: node test.js <scratchDir>   (needs ffmpeg/ffprobe on PATH, or FFMPEG/FFPROBE set). All sample media is generated.
 const fs = require("fs");
+const http = require("http");
 const path = require("path");
 const { spawn } = require("child_process");
 const { run, jpegOrientation, FFMPEG } = require("./render");
 const { analyzeClip } = require("./smart");
-const { tagSize, tagHands } = require("./vision");
+const { tagSize, tagHands, labelShots, MODEL } = require("./vision");
 
 const scratch = path.resolve(process.argv[2]);
 const samples = path.join(scratch, "samples"), work = path.join(scratch, "work"), out = path.join(scratch, "out");
@@ -79,15 +80,34 @@ async function waitForServer() {
   throw new Error("server did not start");
 }
 
-// extra: more files for this job only, { "new name": source path }.
-async function renderJob(job, style, query = "", extra = {}) {
-  const base = `${API}/jobs/${encodeURIComponent(job)}`;
-  const files = [...fs.readdirSync(samples).map((n) => [n, path.join(samples, n)]), ...Object.entries(extra)];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const statusOf = async (base) => (await fetch(`${base}/status`)).json();
+
+// Checks the job's status (like n8n does, but every 0.3 s) until it is done or failed.
+async function waitForJob(base, limitMs = 15 * 60 * 1000) {
+  for (const end = Date.now() + limitMs; Date.now() < end; await sleep(300)) {
+    const st = await statusOf(base);
+    if (st.status === "done" || st.status === "failed") return st;
+  }
+  throw new Error("job did not finish in time");
+}
+
+async function upload(base, files) {
   for (const [name, file] of files) {
     const r = await fetch(`${base}/files/${encodeURIComponent(name)}`, { method: "PUT", body: fs.readFileSync(file) });
     if (!r.ok) throw new Error(`upload ${name}: ${r.status}`);
   }
-  const summary = await (await fetch(`${base}/render?style=${style}${query}`, { method: "POST" })).json();
+}
+const sampleFiles = () => fs.readdirSync(samples).map((n) => [n, path.join(samples, n)]);
+
+// extra: more files for this job only, { "new name": source path }.
+async function renderJob(job, style, query = "", extra = {}) {
+  const base = `${API}/jobs/${encodeURIComponent(job)}`;
+  await upload(base, [...sampleFiles(), ...Object.entries(extra)]);
+  const started = await fetch(`${base}/render?style=${style}${query}`, { method: "POST" });
+  if (started.status !== 202) throw new Error(`render did not start: ${started.status} ${await started.text()}`);
+  const st = await waitForJob(base);
+  const summary = st.status === "done" ? st.result : { ok: false, error: st.error };
   const video = path.join(out, `test-${style}.mp4`);
   fs.writeFileSync(video, Buffer.from(await (await fetch(`${base}/video`)).arrayBuffer()));
   await fetch(base, { method: "DELETE" });
@@ -96,6 +116,9 @@ async function renderJob(job, style, query = "", extra = {}) {
 
 async function main() {
   await makeSamples();
+  // A job that was "working" when the editor stopped (power cut): the restarted editor must mark it failed.
+  fs.mkdirSync(path.join(work, "Interrupted job"), { recursive: true });
+  fs.writeFileSync(path.join(work, "Interrupted job", "status.json"), JSON.stringify({ job: "Interrupted job", status: "working" }));
   // No vision AI during tests (port 9 never answers): results stay the same on every PC, and the fallback gets tested.
   const server = spawn(process.execPath, [path.join(__dirname, "server.js")], {
     env: { ...process.env, WORK_DIR: work, PORT: String(PORT), OLLAMA_URL: "http://127.0.0.1:9" }, stdio: ["ignore", "pipe", "inherit"] });
@@ -128,6 +151,33 @@ async function main() {
     check(near(up.vy, -250 / 1080, 0.05) && Math.abs(up.vx) < 0.03, `sees the camera move up (${up.vy.toFixed(3)}, truth -0.231)`);
     check(Math.hypot(still.vx, still.vy) < 0.02, `sees a still camera (speed ${Math.hypot(still.vx, still.vy).toFixed(3)})`);
     check(blurry.sharp < 0.3 * still.sharp, `sees blur (sharpness ${blurry.sharp.toFixed(0)} vs ${still.sharp.toFixed(0)} sharp)`);
+
+    console.log("\n--- VISION AI (a fake Ollama) ---");
+    let delay = 50;
+    const answer = JSON.stringify({ message: { content: JSON.stringify({ product: "Aula F75 keyboard", hands: true }) } });
+    const fake = http.createServer((req, res) => {
+      if (req.url === "/api/tags") return res.end(JSON.stringify({ models: [{ name: MODEL }] }));
+      req.resume();
+      req.on("end", () => setTimeout(() => res.end(answer), delay));
+    });
+    await new Promise((r) => fake.listen(18091, "127.0.0.1", r));
+    process.env.OLLAMA_URL = "http://127.0.0.1:18091";
+    process.env.VISION_LOOK_LIMIT_MIN = String(1 / 60); // a 1 s limit, so the test doesn't wait 15 minutes
+    const photo = () => [{ name: "01 portrait photo.jpg", kind: "photo", file: path.join(samples, "01 portrait photo.jpg"), info: { duration: 0 } }];
+    let items = photo();
+    const note = await labelShots(FFMPEG, items);
+    check(!note && items[0].labels[0]?.product === "Aula F75 keyboard" && items[0].labels[0].hands === true,
+      "asks the vision AI for the product name and hands");
+    delay = 3000;
+    items = photo();
+    const logs = [], t1 = Date.now();
+    await labelShots(FFMPEG, items, (m) => logs.push(m));
+    const waited = Date.now() - t1;
+    check(waited < 2500 && logs.some((l) => /failed: no answer within 1 s/.test(l)) && items[0].labels.length === 0,
+      `a look slower than the limit is skipped, never stuck (gave up after ${waited} ms)`);
+    fake.close();
+    delete process.env.OLLAMA_URL;
+    delete process.env.VISION_LOOK_LIMIT_MIN;
 
     for (const style of ["smooth", "punchy", "beat", "hype", "soft"]) {
       console.log(`\n--- ${style.toUpperCase()} ---`);
@@ -189,6 +239,30 @@ async function main() {
     check(tagged.length && tagged.every((sh) => sh.size === "wide" && ["context", "payoff"].includes(sh.role)),
       "the clip tagged 'wide' becomes the context or payoff shot (whole product in view)");
 
+    console.log("\n--- BACKGROUND JOBS ---");
+    const bg = `${API}/jobs/${encodeURIComponent("Test background")}`;
+    await upload(bg, sampleFiles());
+    const t0 = Date.now();
+    const post = await fetch(`${bg}/render?style=soft`, { method: "POST" });
+    const answeredIn = Date.now() - t0;
+    check(post.status === 202 && (await post.json()).status === "queued" && answeredIn < 2000, `starts in the background, answers at once (202 in ${answeredIn} ms)`);
+    let st = await statusOf(bg);
+    for (let i = 0; i < 100 && !(st.status === "working" && st.step !== "starting"); i++) { await sleep(100); st = await statusOf(bg); }
+    check(st.status === "working" && !!st.step, `status shows progress while editing ("${st.step}")`);
+    check((await fetch(`${bg}/render?style=soft`, { method: "POST" })).status === 409, "a second start while working is refused (409)");
+    check((await fetch(`${bg}/files/extra.jpg`, { method: "PUT", body: "x" })).status === 409, "uploads while working are refused (409)");
+    check((await fetch(bg, { method: "DELETE" })).status === 409, "deleting while working is refused (409)");
+    check((await fetch(`${bg}/video`)).status === 404, "no video until it is done (404)");
+    const fin = await waitForJob(bg);
+    check(fin.status === "done" && fin.result?.ok === true && fin.seconds >= 1, `finishes as "done" with a summary (${fin.seconds} s)`);
+    const vid = await fetch(`${bg}/video`);
+    check(vid.ok && Number(vid.headers.get("content-length")) > 100000, "the video can be downloaded when done");
+    await vid.arrayBuffer();
+    await fetch(bg, { method: "DELETE" });
+    check((await fetch(`${bg}/status`)).status === 404, "a deleted job is gone (404)");
+    const cut = await statusOf(`${API}/jobs/${encodeURIComponent("Interrupted job")}`);
+    check(cut.status === "failed" && /restarted/.test(cut.error || ""), "a job cut off by a restart is marked failed, so n8n stops waiting");
+
     console.log("\n--- SAFETY ---");
     let r = await fetch(`${API}/jobs/..%2F..%2Fescape/files/..%2Fevil.txt`, { method: "PUT", body: "x" });
     const escaped = fs.existsSync(path.join(scratch, "escape")) || fs.existsSync(path.join(scratch, "evil.txt")) || fs.existsSync(path.join(work, "..", "evil.txt"));
@@ -197,7 +271,7 @@ async function main() {
     check(r.status === 400, "unknown style refused (400)");
     r = await fetch(`${API}/jobs/empty/render?style=smooth`, { method: "POST" });
     const body = await r.json();
-    check(r.status === 500 && /no files were uploaded/.test(body.error), `empty job fails clearly: "${body.error}"`);
+    check(r.status === 400 && /no files were uploaded/.test(body.error), `empty job is refused clearly: "${body.error}"`);
   } finally {
     server.kill();
   }

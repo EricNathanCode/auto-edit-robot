@@ -54,11 +54,19 @@ No published port: only n8n on the same Docker network can reach it, at `http://
 |---|---|---|
 | GET | `/health` | `{ ok, ffmpeg }` |
 | PUT | `/jobs/<job>/files/<name>` | upload one photo or clip (raw body) |
-| POST | `/jobs/<job>/render?style=smart&length=30` | edit; returns a summary (+ shot list for `smart`) |
+| POST | `/jobs/<job>/render?style=smart&length=30` | starts editing **in the background**, answers `202` at once |
+| GET | `/jobs/<job>/status` | `queued` / `working` (with the current step) / `done` (+ summary and shot list) / `failed` (+ reason) |
 | GET | `/jobs/<job>/video` | the finished MP4 |
 | DELETE | `/jobs/<job>` | clean up |
 
-File and job names are sanitised so they can't escape the work folder, one render runs at a time, and the container runs as a non-root user.
+### Built for slow hardware, running 24/7
+On a CPU-only homelab a SMART edit with the vision AI can take **hours** (about 4 minutes per AI look). So:
+- Renders are **background jobs**: n8n starts one, then checks `/status` every few minutes instead of holding one long request open
+- Job status is saved to disk; a job cut off by a restart or power cut is marked **failed** with a reason, so the workflow never waits forever
+- Each AI look gets up to **15 minutes** (`VISION_LOOK_LIMIT_MIN`) through Node's plain `http` client (the built-in `fetch` gives up on its own after 5 minutes without a response); a look that still doesn't answer is skipped and the edit carries on
+- One render at a time; uploads, restarts and deletes of a running job are refused (`409`)
+
+File and job names are sanitised so they can't escape the work folder, and the container runs as a non-root user.
 
 ## Run it
 ```bash
@@ -71,7 +79,7 @@ Optional vision AI: an `ollama` container on the same network with `ollama pull 
 ```bash
 node test.js /tmp/autoedit-test
 ```
-69 end-to-end checks against the real API with generated media: output format (H.264, 30 fps, 1080×1920, no audio, no leftover rotate flag), exact lengths per style, file order, broken-file handling, flash and fade timing, motion-analysis known-answer tests, the Smart Editor's story rules, and path-traversal safety.
+81 end-to-end checks against the real API with generated media: output format (H.264, 30 fps, 1080×1920, no audio, no leftover rotate flag), exact lengths per style, file order, broken-file handling, flash and fade timing, motion-analysis known-answer tests, the Smart Editor's story rules, the vision AI against a fake Ollama (including a look that's too slow), background jobs (instant start, progress, 409s, restart recovery), and path-traversal safety.
 
 ## Tech
 Node.js (no dependencies) · FFmpeg (filter graphs, xfade, zoompan) · Docker · n8n · Ollama · Proxmox VE · Google Drive API (OAuth, least-privilege scopes)
