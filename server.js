@@ -1,9 +1,11 @@
 // Auto Edit Robot API (no open port: only n8n on the Docker network "ai" can reach it at http://autoedit:8090).
-//   GET    /health                       → { ok, ffmpeg }
+//   GET    /health                       → { ok, ffmpeg, jobsWaiting }
+//   POST   /jobs/<job>                   → reserves a fresh job ("receiving") before its files are sent
 //   PUT    /jobs/<job>/files/<name>      → raw file body, saved to <job>/in/<name>
 //   POST   /jobs/<job>/render?style=...  → starts editing in the background (smooth | punchy | beat | hype | soft | smart,
 //                                          &length= seconds for smart) and answers 202 at once
-//   GET    /jobs/<job>/status            → { status: queued | working | done | failed, step, seconds, result | error }
+//   GET    /jobs/<job>/status            → { status: receiving | queued | working | done | failed, step, seconds, files,
+//                                          result | error }
 //   GET    /jobs/<job>/video             → the finished MP4
 //   DELETE /jobs/<job>                   → removes the job's files
 // A SMART edit can take hours on a CPU-only homelab, so n8n starts the job and checks /status every few minutes
@@ -43,11 +45,13 @@ function readStatus(jobDir) {
 }
 const busy = (st) => st && (st.status === "queued" || st.status === "working");
 
-// A job that was queued or working when the editor stopped will never finish: say so, so n8n stops waiting.
+const inFiles = (jobDir) => { try { return fs.readdirSync(path.join(jobDir, "in")).length; } catch { return 0; } };
+
+// A job that was receiving, queued or working when the editor stopped will never finish: say so, so n8n stops waiting.
 fs.mkdirSync(WORK, { recursive: true });
 for (const name of fs.readdirSync(WORK)) {
   const jobDir = path.join(WORK, name), st = readStatus(jobDir);
-  if (busy(st)) saveStatus(jobDir, { ...st, status: "failed", finishedAt: new Date().toISOString(),
+  if (busy(st) || st?.status === "receiving") saveStatus(jobDir, { ...st, status: "failed", finishedAt: new Date().toISOString(),
     error: "the editor restarted before this job finished: start it again" });
 }
 
@@ -88,6 +92,13 @@ async function handle(req, res) {
   const jobDir = path.join(WORK, clean(parts[1]));
   const st = readStatus(jobDir);
 
+  if (req.method === "POST" && parts.length === 2) { // reserve a fresh job (any old files of the same name are cleared)
+    if (busy(st)) return send(res, 409, { ok: false, error: `job is ${st.status}: wait until it is done` });
+    fs.rmSync(jobDir, { recursive: true, force: true });
+    saveStatus(jobDir, { job: path.basename(jobDir), status: "receiving", createdAt: new Date().toISOString() });
+    return send(res, 201, { ok: true, job: path.basename(jobDir), status: "receiving" });
+  }
+
   if (req.method === "PUT" && parts[2] === "files" && parts[3]) {
     if (busy(st)) return send(res, 409, { ok: false, error: `job is ${st.status}: wait until it is done` });
     const inDir = path.join(jobDir, "in");
@@ -97,20 +108,24 @@ async function handle(req, res) {
     return send(res, 200, { ok: true, file: path.basename(file), bytes: fs.statSync(file).size });
   }
   if (req.method === "POST" && parts[2] === "render") {
-    const style = (url.searchParams.get("style") || "smooth").toLowerCase();
-    if (!STYLE_NAMES.includes(style)) return send(res, 400, { ok: false, error: `unknown style "${style}"` });
-    const length = url.searchParams.has("length") ? Number(url.searchParams.get("length")) : undefined; // smart only
-    if (length !== undefined && !(length >= 5 && length <= 180)) return send(res, 400, { ok: false, error: "length must be 5-180 seconds" });
-    const inDir = path.join(jobDir, "in");
-    if (!fs.existsSync(inDir) || !fs.readdirSync(inDir).length) return send(res, 400, { ok: false, error: "no files were uploaded" });
     if (busy(st)) return send(res, 409, { ok: false, error: `job is already ${st.status}` });
+    // A reserved job that can't start is marked failed, so whoever checks its status learns why.
+    const refuse = (error) => {
+      if (st) saveStatus(jobDir, { ...st, status: "failed", finishedAt: new Date().toISOString(), error });
+      return send(res, 400, { ok: false, error });
+    };
+    const style = (url.searchParams.get("style") || "smooth").toLowerCase();
+    if (!STYLE_NAMES.includes(style)) return refuse(`unknown style "${style}"`);
+    const length = url.searchParams.has("length") ? Number(url.searchParams.get("length")) : undefined; // smart only
+    if (length !== undefined && !(length >= 5 && length <= 180)) return refuse("length must be 5-180 seconds");
+    if (!inFiles(jobDir)) return refuse("no files were uploaded");
     const ahead = startJob(jobDir, style, length);
     return send(res, 202, { ok: true, job: path.basename(jobDir), status: "queued", jobsAhead: ahead });
   }
   if (req.method === "GET" && parts[2] === "status") {
     if (!st) return send(res, 404, { ok: false, error: "no such job" });
-    const since = st.startedAt || st.queuedAt, until = st.finishedAt ? Date.parse(st.finishedAt) : Date.now();
-    return send(res, 200, { ok: true, ...st, seconds: since ? Math.round((until - Date.parse(since)) / 1000) : 0 });
+    const since = st.startedAt || st.queuedAt || st.createdAt, until = st.finishedAt ? Date.parse(st.finishedAt) : Date.now();
+    return send(res, 200, { ok: true, ...st, seconds: since ? Math.round((until - Date.parse(since)) / 1000) : 0, files: inFiles(jobDir) });
   }
   if (req.method === "GET" && parts[2] === "video") {
     const file = path.join(jobDir, "out.mp4");

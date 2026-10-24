@@ -119,6 +119,8 @@ async function main() {
   // A job that was "working" when the editor stopped (power cut): the restarted editor must mark it failed.
   fs.mkdirSync(path.join(work, "Interrupted job"), { recursive: true });
   fs.writeFileSync(path.join(work, "Interrupted job", "status.json"), JSON.stringify({ job: "Interrupted job", status: "working" }));
+  fs.mkdirSync(path.join(work, "Interrupted upload"), { recursive: true });
+  fs.writeFileSync(path.join(work, "Interrupted upload", "status.json"), JSON.stringify({ job: "Interrupted upload", status: "receiving" }));
   // No vision AI during tests (port 9 never answers): results stay the same on every PC, and the fallback gets tested.
   const server = spawn(process.execPath, [path.join(__dirname, "server.js")], {
     env: { ...process.env, WORK_DIR: work, PORT: String(PORT), OLLAMA_URL: "http://127.0.0.1:9" }, stdio: ["ignore", "pipe", "inherit"] });
@@ -261,7 +263,26 @@ async function main() {
     await fetch(bg, { method: "DELETE" });
     check((await fetch(`${bg}/status`)).status === 404, "a deleted job is gone (404)");
     const cut = await statusOf(`${API}/jobs/${encodeURIComponent("Interrupted job")}`);
-    check(cut.status === "failed" && /restarted/.test(cut.error || ""), "a job cut off by a restart is marked failed, so n8n stops waiting");
+    const cutUp = await statusOf(`${API}/jobs/${encodeURIComponent("Interrupted upload")}`);
+    check(cut.status === "failed" && /restarted/.test(cut.error || "") && cutUp.status === "failed",
+      "jobs cut off by a restart (editing or receiving) are marked failed, so n8n stops waiting");
+
+    console.log("\n--- RESERVING A JOB (what n8n does first) ---");
+    const rj = `${API}/jobs/${encodeURIComponent("1AbC-drive_folder_id")}`;
+    let r0 = await fetch(rj, { method: "POST" });
+    let s0 = await statusOf(rj);
+    check(r0.status === 201 && s0.status === "receiving" && s0.files === 0, `reserving answers 201 and the job waits for files ("${s0.status}", ${s0.files} files)`);
+    await upload(rj, [["01 portrait photo.jpg", path.join(samples, "01 portrait photo.jpg")]]);
+    s0 = await statusOf(rj);
+    check(s0.status === "receiving" && s0.files === 1, `status counts the files that arrived (${s0.files})`);
+    r0 = await fetch(`${rj}/render?style=smart&length=500`, { method: "POST" });
+    s0 = await statusOf(rj);
+    check(r0.status === 400 && s0.status === "failed" && /length must be/.test(s0.error || ""),
+      `a reserved job that can't start is marked failed with the reason ("${s0.error}")`);
+    r0 = await fetch(rj, { method: "POST" });
+    s0 = await statusOf(rj);
+    check(r0.status === 201 && s0.status === "receiving" && s0.files === 0, "reserving again starts fresh (old files cleared)");
+    await fetch(rj, { method: "DELETE" });
 
     console.log("\n--- SAFETY ---");
     let r = await fetch(`${API}/jobs/..%2F..%2Fescape/files/..%2Fevil.txt`, { method: "PUT", body: "x" });
