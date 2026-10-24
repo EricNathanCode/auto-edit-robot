@@ -1,0 +1,9 @@
+# Only the code goes into the image: never footage, previews or reference videos.
+my-footage
+preview
+reference
+test.js
+*.mp4
+*.mov
+*.png
+*.jpg
